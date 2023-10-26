@@ -33,7 +33,7 @@ RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt \
 FROM scratch AS go2rtc
 ARG TARGETARCH
 WORKDIR /rootfs/usr/local/go2rtc/bin
-ADD --link --chmod=755 "https://github.com/AlexxIT/go2rtc/releases/download/v1.7.1/go2rtc_linux_${TARGETARCH}" go2rtc
+ADD --link --chmod=755 "https://github.com/AlexxIT/go2rtc/releases/download/v1.8.1/go2rtc_linux_${TARGETARCH}" go2rtc
 
 
 ####
@@ -121,13 +121,15 @@ RUN apt-get -qq update \
     apt-transport-https \
     gnupg \
     wget \
-    && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 648ACFD622F3D138 \
-    && echo "deb http://deb.debian.org/debian bullseye main contrib non-free" | tee /etc/apt/sources.list.d/raspi.list \
+    # the key fingerprint can be obtained from https://ftp-master.debian.org/keys.html
+    && wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xA4285295FC7B1A81600062A9605C66F00D6C9793" | \
+    gpg --dearmor > /usr/share/keyrings/debian-archive-bullseye-stable.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/debian-archive-bullseye-stable.gpg] http://deb.debian.org/debian bullseye main contrib non-free" | \
+    tee /etc/apt/sources.list.d/debian-bullseye-nonfree.list \
     && apt-get -qq update \
     && apt-get -qq install -y \
     python3.9 \
     python3.9-dev \
-    wget \
     # opencv dependencies
     build-essential cmake git pkg-config libgtk-3-dev \
     libavcodec-dev libavformat-dev libswscale-dev libv4l-dev \
