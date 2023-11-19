@@ -25,22 +25,9 @@ cameras:
 
 VSCode (and VSCode addon) supports the JSON schemas which will automatically validate the config. This can be added by adding `# yaml-language-server: $schema=http://frigate_host:5000/api/config/schema.json` to the top of the config file. `frigate_host` being the IP address of Frigate or `ccab4aaf-frigate` if running in the addon.
 
-### Full configuration reference:
+### Environment Variable Substitution
 
-:::caution
-
-It is not recommended to copy this full configuration file. Only specify values that are different from the defaults. Configuration options and default values may change in future versions.
-
-:::
-
-**Note:** The following values will be replaced at runtime by using environment variables
-
-- `{FRIGATE_MQTT_USER}`
-- `{FRIGATE_MQTT_PASSWORD}`
-- `{FRIGATE_RTSP_USER}`
-- `{FRIGATE_RTSP_PASSWORD}`
-
-for example:
+Frigate supports the use of environment variables starting with `FRIGATE_` **only** where specifically indicated in the configuration reference below. For example, the following values can be replaced at runtime by using environment variables:
 
 ```yaml
 mqtt:
@@ -60,6 +47,14 @@ onvif:
   password: "{FRIGATE_RTSP_PASSWORD}"
 ```
 
+### Full configuration reference:
+
+:::caution
+
+It is not recommended to copy this full configuration file. Only specify values that are different from the defaults. Configuration options and default values may change in future versions.
+
+:::
+
 ```yaml
 mqtt:
   # Optional: Enable mqtt server (default: shown below)
@@ -75,11 +70,11 @@ mqtt:
   # NOTE: must be unique if you are running multiple instances
   client_id: frigate
   # Optional: user
-  # NOTE: MQTT user can be specified with an environment variables that must begin with 'FRIGATE_'.
+  # NOTE: MQTT user can be specified with an environment variables or docker secrets that must begin with 'FRIGATE_'.
   #       e.g. user: '{FRIGATE_MQTT_USER}'
   user: mqtt_user
   # Optional: password
-  # NOTE: MQTT password can be specified with an environment variables that must begin with 'FRIGATE_'.
+  # NOTE: MQTT password can be specified with an environment variables or docker secrets that must begin with 'FRIGATE_'.
   #       e.g. password: '{FRIGATE_MQTT_PASSWORD}'
   password: password
   # Optional: tls_ca_certs for enabling TLS using self-signed certs (default: None)
@@ -222,15 +217,17 @@ ffmpeg:
 # Optional: Detect configuration
 # NOTE: Can be overridden at the camera level
 detect:
-  # Optional: width of the frame for the input with the detect role (default: shown below)
+  # Optional: width of the frame for the input with the detect role (default: use native stream resolution)
   width: 1280
-  # Optional: height of the frame for the input with the detect role (default: shown below)
+  # Optional: height of the frame for the input with the detect role (default: use native stream resolution)
   height: 720
   # Optional: desired fps for your camera for the input with the detect role (default: shown below)
   # NOTE: Recommended value of 5. Ideally, try and reduce your FPS on the camera.
   fps: 5
   # Optional: enables detection for the camera (default: True)
   enabled: True
+  # Optional: Number of consecutive detection hits required for an object to be initialized in the tracker. (default: 1/2 the frame rate)
+  min_initialized: 2
   # Optional: Number of frames without a detection before Frigate considers an object to be gone. (default: 5x the frame rate)
   max_disappeared: 25
   # Optional: Configuration for stationary object tracking
@@ -348,8 +345,8 @@ record:
   # Optional: Number of minutes to wait between cleanup runs (default: shown below)
   # This can be used to reduce the frequency of deleting recording segments from disk if you want to minimize i/o
   expire_interval: 60
-  # Optional: Sync recordings with disk on startup (default: shown below).
-  sync_on_startup: False
+  # Optional: Sync recordings with disk on startup and once a day (default: shown below).
+  sync_recordings: False
   # Optional: Retention settings for recording
   retain:
     # Optional: Number of days to retain recordings regardless of events (default: shown below)
@@ -436,7 +433,7 @@ rtmp:
   enabled: False
 
 # Optional: Restream configuration
-# Uses https://github.com/AlexxIT/go2rtc (v1.8.1)
+# Uses https://github.com/AlexxIT/go2rtc (v1.8.3)
 go2rtc:
 
 # Optional: jsmpeg stream configuration for WebUI
@@ -489,7 +486,7 @@ cameras:
       # Required: A list of input streams for the camera. See documentation for more information.
       inputs:
         # Required: the path to the stream
-        # NOTE: path may include environment variables, which must begin with 'FRIGATE_' and be referenced in {}
+        # NOTE: path may include environment variables or docker secrets, which must begin with 'FRIGATE_' and be referenced in {}
         - path: rtsp://viewer:{FRIGATE_RTSP_PASSWORD}@10.0.10.10:554/cam/realmonitor?channel=1&subtype=2
           # Required: list of roles for this stream. valid values are: audio,detect,record,rtmp
           # NOTICE: In addition to assigning the audio, record, and rtmp roles,
@@ -517,6 +514,9 @@ cameras:
     # Optional: timeout for highest scoring image before allowing it
     # to be replaced by a newer image. (default: shown below)
     best_image_timeout: 60
+
+    # Optional: URL to visit the camera web UI directly from the system page. Might not be available on every camera.
+    webui_url: ""
 
     # Optional: zones for this camera
     zones:

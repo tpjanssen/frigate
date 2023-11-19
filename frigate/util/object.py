@@ -30,7 +30,9 @@ GRID_SIZE = 8
 
 
 def get_camera_regions_grid(
-    name: str, detect: DetectConfig
+    name: str,
+    detect: DetectConfig,
+    min_region_size: int,
 ) -> list[list[dict[str, any]]]:
     """Build a grid of expected region sizes for a camera."""
     # get grid from db if available
@@ -99,7 +101,7 @@ def get_camera_regions_grid(
             box[1] * height,
             (box[0] + box[2]) * width,
             (box[1] + box[3]) * height,
-            320,
+            min_region_size,
             1.35,
         )
         # save width of region to grid as relative
@@ -174,9 +176,9 @@ def get_region_from_grid(
 
     cell = region_grid[grid_x][grid_y]
 
-    # if there is no known data, get standard region for motion box
+    # if there is no known data, use original region calculation
     if not cell or not cell["sizes"]:
-        return calculate_region(frame_shape, box[0], box[1], box[2], box[3], min_region)
+        return box
 
     # convert the calculated region size to relative
     calc_size = (box[2] - box[0]) / frame_shape[1]

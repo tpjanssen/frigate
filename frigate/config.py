@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from enum import Enum
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
@@ -16,7 +17,9 @@ from frigate.const import (
     ALL_ATTRIBUTE_LABELS,
     AUDIO_MIN_CONFIDENCE,
     CACHE_DIR,
+    CACHE_SEGMENT_FORMAT,
     DEFAULT_DB_PATH,
+    MAX_PRE_CAPTURE,
     REGEX_CAMERA_NAME,
     YAML_EXT,
 )
@@ -47,6 +50,13 @@ DEFAULT_TIME_FORMAT = "%m/%d/%Y %H:%M:%S"
 # DEFAULT_TIME_FORMAT = "%d.%m.%Y %H:%M:%S"
 
 FRIGATE_ENV_VARS = {k: v for k, v in os.environ.items() if k.startswith("FRIGATE_")}
+# read docker secret files as env vars too
+if os.path.isdir("/run/secrets"):
+    for secret_file in os.listdir("/run/secrets"):
+        if secret_file.startswith("FRIGATE_"):
+            FRIGATE_ENV_VARS[secret_file] = Path(
+                os.path.join("/run/secrets", secret_file)
+            ).read_text()
 
 DEFAULT_TRACKED_OBJECTS = ["person"]
 DEFAULT_LISTEN_AUDIO = ["bark", "fire_alarm", "scream", "speech", "yell"]
@@ -171,9 +181,12 @@ class PtzAutotrackConfig(FrigateBaseModel):
     timeout: int = Field(
         default=10, title="Seconds to delay before returning to preset."
     )
-    movement_weights: Optional[Union[float, List[float]]] = Field(
+    movement_weights: Optional[Union[str, List[str]]] = Field(
         default=[],
         title="Internal value used for PTZ movements based on the speed of your camera's motor.",
+    )
+    enabled_in_config: Optional[bool] = Field(
+        title="Keep track of original state of autotracking."
     )
 
     @validator("movement_weights", pre=True)
@@ -220,7 +233,9 @@ class RetainConfig(FrigateBaseModel):
 
 
 class EventsConfig(FrigateBaseModel):
-    pre_capture: int = Field(default=5, title="Seconds to retain before event starts.")
+    pre_capture: int = Field(
+        default=5, title="Seconds to retain before event starts.", le=MAX_PRE_CAPTURE
+    )
     post_capture: int = Field(default=5, title="Seconds to retain after event ends.")
     required_zones: List[str] = Field(
         default_factory=list,
@@ -247,8 +262,8 @@ class RecordExportConfig(FrigateBaseModel):
 
 class RecordConfig(FrigateBaseModel):
     enabled: bool = Field(default=False, title="Enable record on all cameras.")
-    sync_on_startup: bool = Field(
-        default=False, title="Sync recordings with disk on startup."
+    sync_recordings: bool = Field(
+        default=False, title="Sync recordings with disk on startup and once a day."
     )
     expire_interval: int = Field(
         default=60,
@@ -352,6 +367,9 @@ class DetectConfig(FrigateBaseModel):
         default=5, title="Number of frames per second to process through detection."
     )
     enabled: bool = Field(default=True, title="Detection Enabled.")
+    min_initialized: Optional[int] = Field(
+        title="Minimum number of consecutive hits for an object to be initialized by the tracker."
+    )
     max_disappeared: Optional[int] = Field(
         title="Maximum number of frames the object can dissapear before detection ends."
     )
@@ -728,6 +746,9 @@ class CameraConfig(FrigateBaseModel):
         default=60,
         title="How long to wait for the image with the highest confidence score.",
     )
+    webui_url: Optional[str] = Field(
+        title="URL to visit the camera directly from system page",
+    )
     zones: Dict[str, ZoneConfig] = Field(
         default_factory=dict, title="Zone configuration."
     )
@@ -851,7 +872,7 @@ class CameraConfig(FrigateBaseModel):
 
             ffmpeg_output_args = (
                 record_args
-                + [f"{os.path.join(CACHE_DIR, self.name)}-%Y%m%d%H%M%S.mp4"]
+                + [f"{os.path.join(CACHE_DIR, self.name)}@{CACHE_SEGMENT_FORMAT}.mp4"]
                 + ffmpeg_output_args
             )
 
@@ -1143,6 +1164,11 @@ class FrigateConfig(FrigateBaseModel):
                             else DEFAULT_DETECT_DIMENSIONS["height"]
                         )
 
+            # Default min_initialized configuration
+            min_initialized = camera_config.detect.fps / 2
+            if camera_config.detect.min_initialized is None:
+                camera_config.detect.min_initialized = min_initialized
+
             # Default max_disappeared configuration
             max_disappeared = camera_config.detect.fps * 5
             if camera_config.detect.max_disappeared is None:
@@ -1171,6 +1197,9 @@ class FrigateConfig(FrigateBaseModel):
             # set config pre-value
             camera_config.record.enabled_in_config = camera_config.record.enabled
             camera_config.audio.enabled_in_config = camera_config.audio.enabled
+            camera_config.onvif.autotracking.enabled_in_config = (
+                camera_config.onvif.autotracking.enabled
+            )
 
             # Add default filters
             object_keys = camera_config.objects.track

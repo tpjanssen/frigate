@@ -31,7 +31,7 @@ First, set up a PTZ preset in your camera's firmware and give it a name. If you'
 
 Edit your Frigate configuration file and enter the ONVIF parameters for your camera. Specify the object types to track, a required zone the object must enter to begin autotracking, and the camera preset name you configured in your camera's firmware to return to when tracking has ended. Optionally, specify a delay in seconds before Frigate returns the camera to the preset.
 
-An [ONVIF connection](cameras.md) is required for autotracking to function.
+An [ONVIF connection](cameras.md) is required for autotracking to function. Also, a [motion mask](masks.md) over your camera's timestamp and any overlay text is recommended to ensure they are completely excluded from scene change calculations when the camera is moving.
 
 Note that `autotracking` is disabled by default but can be enabled in the configuration or by MQTT.
 
@@ -113,7 +113,7 @@ If you initially calibrate with zooming disabled and then enable zooming at a la
 
 Every PTZ camera is different, so autotracking may not perform ideally in every situation. This experimental feature was initially developed using an EmpireTech/Dahua SD1A404XB-GNR.
 
-The object tracker in Frigate estimates the motion of the PTZ so that tracked objects are preserved when the camera moves. In most cases (especially for faster moving objects), the default 5 fps is insufficient for the motion estimator to perform accurately. 10 fps is the current recommendation. Higher frame rates will likely not be more performant and will only slow down Frigate and the motion estimator. Adjust your camera to output at least 10 frames per second and change the `fps` parameter in the [detect configuration](index.md) of your configuration file.
+The object tracker in Frigate estimates the motion of the PTZ so that tracked objects are preserved when the camera moves. In most cases 5 fps is sufficient, but if you plan to track faster moving objects, you may want to increase this slightly. Higher frame rates (> 10fps) will only slow down Frigate and the motion estimator and may lead to dropped frames, especially if you are using experimental zooming.
 
 A fast [detector](object_detectors.md) is recommended. CPU detectors will not perform well or won't work at all. You can watch Frigate's debug viewer for your camera to see a thicker colored box around the object currently being autotracked.
 
@@ -160,3 +160,7 @@ This is often caused by the same reason as above - the `MoveStatus` ONVIF parame
 ### I'm seeing this error in the logs: "Autotracker: motion estimator couldn't get transformations". What does this mean?
 
 To maintain object tracking during PTZ moves, Frigate tracks the motion of your camera based on the details of the frame. If you are seeing this message, it could mean that your `zoom_factor` may be set too high, the scene around your detected object does not have enough details (like hard edges or color variatons), or your camera's shutter speed is too slow and motion blur is occurring. Try reducing `zoom_factor`, finding a way to alter the scene around your object, or changing your camera's shutter speed.
+
+### Calibration seems to have completed, but the camera is not actually moving to track my object. Why?
+
+Some cameras have firmware that reports that FOV RelativeMove, the ONVIF command that Frigate uses for autotracking, is supported. However, if the camera does not pan or tilt when an object comes into the required zone, your camera's firmware does not actually support FOV RelativeMove. One such camera is the Uniview IPC672LR-AX4DUPK. It actually moves its zoom motor instead of panning and tilting and does not follow the ONVIF standard whatsoever.

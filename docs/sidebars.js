@@ -5,6 +5,7 @@ module.exports = {
       "frigate/hardware",
       "frigate/installation",
       "frigate/camera_setup",
+      "frigate/video_pipeline",
     ],
     Guides: [
       "guides/getting_started",
@@ -21,7 +22,7 @@ module.exports = {
         {
           type: "link",
           label: "Go2RTC Configuration Reference",
-          href: "https://github.com/AlexxIT/go2rtc/tree/v1.8.1#configuration",
+          href: "https://github.com/AlexxIT/go2rtc/tree/v1.8.2#configuration",
         },
       ],
       Detectors: [
@@ -32,6 +33,7 @@ module.exports = {
         "configuration/cameras",
         "configuration/record",
         "configuration/snapshots",
+        "configuration/motion_detection",
         "configuration/birdseye",
         "configuration/live",
         "configuration/restream",

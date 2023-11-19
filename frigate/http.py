@@ -41,7 +41,7 @@ from frigate.const import (
     RECORD_DIR,
 )
 from frigate.events.external import ExternalEventProcessor
-from frigate.models import Event, Recordings, Timeline
+from frigate.models import Event, Recordings, Regions, Timeline
 from frigate.object_processing import TrackedObject
 from frigate.plus import PlusApi
 from frigate.ptz.onvif import OnvifController
@@ -115,7 +115,7 @@ def is_healthy():
 @bp.route("/events/summary")
 def events_summary():
     tz_name = request.args.get("timezone", default="utc", type=str)
-    hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
+    hour_modifier, minute_modifier, seconds_offset = get_tz_modifiers(tz_name)
     has_clip = request.args.get("has_clip", type=int)
     has_snapshot = request.args.get("has_snapshot", type=int)
 
@@ -149,12 +149,7 @@ def events_summary():
             Event.camera,
             Event.label,
             Event.sub_label,
-            fn.strftime(
-                "%Y-%m-%d",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
-            ),
+            (Event.start_time + seconds_offset).cast("int") / (3600 * 24),
             Event.zones,
         )
     )
@@ -726,6 +721,112 @@ def label_snapshot(camera_name, label):
         return response
 
 
+@bp.route("/<camera_name>/grid.jpg")
+def grid_snapshot(camera_name):
+    request.args.get("type", default="region")
+
+    if camera_name in current_app.frigate_config.cameras:
+        detect = current_app.frigate_config.cameras[camera_name].detect
+        frame = current_app.detected_frames_processor.get_current_frame(camera_name, {})
+        retry_interval = float(
+            current_app.frigate_config.cameras.get(camera_name).ffmpeg.retry_interval
+            or 10
+        )
+
+        if frame is None or datetime.now().timestamp() > (
+            current_app.detected_frames_processor.get_current_frame_time(camera_name)
+            + retry_interval
+        ):
+            return make_response(
+                jsonify({"success": False, "message": "Unable to get valid frame"}),
+                500,
+            )
+
+        try:
+            grid = (
+                Regions.select(Regions.grid)
+                .where(Regions.camera == camera_name)
+                .get()
+                .grid
+            )
+        except DoesNotExist:
+            return make_response(
+                jsonify({"success": False, "message": "Unable to get region grid"}),
+                500,
+            )
+
+        grid_size = len(grid)
+        grid_coef = 1.0 / grid_size
+        width = detect.width
+        height = detect.height
+        for x in range(grid_size):
+            for y in range(grid_size):
+                cell = grid[x][y]
+
+                if len(cell["sizes"]) == 0:
+                    continue
+
+                std_dev = round(cell["std_dev"] * width, 2)
+                mean = round(cell["mean"] * width, 2)
+                cv2.rectangle(
+                    frame,
+                    (int(x * grid_coef * width), int(y * grid_coef * height)),
+                    (
+                        int((x + 1) * grid_coef * width),
+                        int((y + 1) * grid_coef * height),
+                    ),
+                    (0, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    f"#: {len(cell['sizes'])}",
+                    (
+                        int(x * grid_coef * width + 10),
+                        int((y * grid_coef + 0.02) * height),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.5,
+                    color=(0, 255, 0),
+                    thickness=2,
+                )
+                cv2.putText(
+                    frame,
+                    f"std: {std_dev}",
+                    (
+                        int(x * grid_coef * width + 10),
+                        int((y * grid_coef + 0.05) * height),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.5,
+                    color=(0, 255, 0),
+                    thickness=2,
+                )
+                cv2.putText(
+                    frame,
+                    f"avg: {mean}",
+                    (
+                        int(x * grid_coef * width + 10),
+                        int((y * grid_coef + 0.08) * height),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.5,
+                    color=(0, 255, 0),
+                    thickness=2,
+                )
+
+        ret, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        response = make_response(jpg.tobytes())
+        response.headers["Content-Type"] = "image/jpeg"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    else:
+        return make_response(
+            jsonify({"success": False, "message": "Camera not found"}),
+            404,
+        )
+
+
 @bp.route("/events/<id>/clip.mp4")
 def event_clip(id):
     download = request.args.get("download", type=bool)
@@ -889,7 +990,7 @@ def events():
     if time_range != DEFAULT_TIME_RANGE:
         # get timezone arg to ensure browser times are used
         tz_name = request.args.get("timezone", default="utc", type=str)
-        hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
+        hour_modifier, minute_modifier, _ = get_tz_modifiers(tz_name)
 
         times = time_range.split(",")
         time_after = times[0]
@@ -946,7 +1047,7 @@ def events():
     if is_submitted is not None:
         if is_submitted == 0:
             clauses.append((Event.plus_id.is_null()))
-        else:
+        elif is_submitted > 0:
             clauses.append((Event.plus_id != ""))
 
     if len(clauses) == 0:
@@ -1388,6 +1489,8 @@ def get_snapshot_from_recording(camera_name: str, frame_time: str):
             )
         )
         .where(Recordings.camera == camera_name)
+        .order_by(Recordings.start_time.desc())
+        .limit(1)
     )
 
     try:
@@ -1461,7 +1564,7 @@ def get_recordings_storage_usage():
 @bp.route("/<camera_name>/recordings/summary")
 def recordings_summary(camera_name):
     tz_name = request.args.get("timezone", default="utc", type=str)
-    hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
+    hour_modifier, minute_modifier, seconds_offset = get_tz_modifiers(tz_name)
     recording_groups = (
         Recordings.select(
             fn.strftime(
@@ -1475,22 +1578,8 @@ def recordings_summary(camera_name):
             fn.SUM(Recordings.objects).alias("objects"),
         )
         .where(Recordings.camera == camera_name)
-        .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
-            )
-        )
-        .order_by(
-            fn.strftime(
-                "%Y-%m-%d H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
-            ).desc()
-        )
+        .group_by((Recordings.start_time + seconds_offset).cast("int") / 3600)
+        .order_by(Recordings.start_time.desc())
         .namedtuples()
     )
 
@@ -1505,14 +1594,7 @@ def recordings_summary(camera_name):
             fn.COUNT(Event.id).alias("count"),
         )
         .where(Event.camera == camera_name, Event.has_clip)
-        .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
-            ),
-        )
+        .group_by((Event.start_time + seconds_offset).cast("int") / 3600)
         .namedtuples()
     )
 
@@ -1995,3 +2077,30 @@ def logs(service: str):
             jsonify({"success": False, "message": "Could not find log file"}),
             500,
         )
+
+
+@bp.route("/restart", methods=["POST"])
+def restart():
+    try:
+        restart_frigate()
+    except Exception as e:
+        logging.error(f"Error restarting Frigate: {e}")
+        return make_response(
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Unable to restart Frigate.",
+                }
+            ),
+            500,
+        )
+
+    return make_response(
+        jsonify(
+            {
+                "success": True,
+                "message": "Restarting (this can take up to one minute)...",
+            }
+        ),
+        200,
+    )

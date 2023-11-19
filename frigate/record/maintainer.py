@@ -20,8 +20,10 @@ import psutil
 from frigate.config import FrigateConfig, RetainModeEnum
 from frigate.const import (
     CACHE_DIR,
+    CACHE_SEGMENT_FORMAT,
     INSERT_MANY_RECORDINGS,
     MAX_SEGMENT_DURATION,
+    MAX_SEGMENTS_IN_CACHE,
     RECORD_DIR,
 )
 from frigate.models import Event, Recordings
@@ -30,6 +32,8 @@ from frigate.util.image import area
 from frigate.util.services import get_video_properties
 
 logger = logging.getLogger(__name__)
+
+QUEUE_READ_TIMEOUT = 0.00001  # seconds
 
 
 class SegmentInfo:
@@ -74,15 +78,13 @@ class RecordingMaintainer(threading.Thread):
         self.end_time_cache: dict[str, Tuple[datetime.datetime, float]] = {}
 
     async def move_files(self) -> None:
-        cache_files = sorted(
-            [
-                d
-                for d in os.listdir(CACHE_DIR)
-                if os.path.isfile(os.path.join(CACHE_DIR, d))
-                and d.endswith(".mp4")
-                and not d.startswith("clip_")
-            ]
-        )
+        cache_files = [
+            d
+            for d in os.listdir(CACHE_DIR)
+            if os.path.isfile(os.path.join(CACHE_DIR, d))
+            and d.endswith(".mp4")
+            and not d.startswith("clip_")
+        ]
 
         files_in_use = []
         for process in psutil.process_iter():
@@ -106,8 +108,12 @@ class RecordingMaintainer(threading.Thread):
 
             cache_path = os.path.join(CACHE_DIR, cache)
             basename = os.path.splitext(cache)[0]
-            camera, date = basename.rsplit("-", maxsplit=1)
-            start_time = datetime.datetime.strptime(date, "%Y%m%d%H%M%S")
+            camera, date = basename.rsplit("@", maxsplit=1)
+
+            # important that start_time is utc because recordings are stored and compared in utc
+            start_time = datetime.datetime.strptime(
+                date, CACHE_SEGMENT_FORMAT
+            ).astimezone(datetime.timezone.utc)
 
             grouped_recordings[camera].append(
                 {
@@ -116,9 +122,14 @@ class RecordingMaintainer(threading.Thread):
                 }
             )
 
-        # delete all cached files past the most recent 5
-        keep_count = 5
+        # delete all cached files past the most recent MAX_SEGMENTS_IN_CACHE
+        keep_count = MAX_SEGMENTS_IN_CACHE
         for camera in grouped_recordings.keys():
+            # sort based on start time
+            grouped_recordings[camera] = sorted(
+                grouped_recordings[camera], key=lambda s: s["start_time"]
+            )
+
             segment_count = len(grouped_recordings[camera])
             if segment_count > keep_count:
                 logger.warning(
@@ -163,8 +174,6 @@ class RecordingMaintainer(threading.Thread):
                     Event.has_clip,
                 )
                 .order_by(Event.start_time)
-                .namedtuples()
-                .iterator()
             )
 
             tasks.extend(
@@ -217,12 +226,8 @@ class RecordingMaintainer(threading.Thread):
 
         # if cached file's start_time is earlier than the retain days for the camera
         if start_time <= (
-            (
-                datetime.datetime.now()
-                - datetime.timedelta(
-                    days=self.config.cameras[camera].record.retain.days
-                )
-            )
+            datetime.datetime.now().astimezone(datetime.timezone.utc)
+            - datetime.timedelta(days=self.config.cameras[camera].record.retain.days)
         ):
             # if the cached segment overlaps with the events:
             overlaps = False
@@ -256,19 +261,35 @@ class RecordingMaintainer(threading.Thread):
             # if it ends more than the configured pre_capture for the camera
             else:
                 pre_capture = self.config.cameras[camera].record.events.pre_capture
-                most_recently_processed_frame_time = self.object_recordings_info[
-                    camera
-                ][-1][0]
-                retain_cutoff = most_recently_processed_frame_time - pre_capture
-                if end_time.timestamp() < retain_cutoff:
+                camera_info = self.object_recordings_info[camera]
+                most_recently_processed_frame_time = (
+                    camera_info[-1][0] if len(camera_info) > 0 else 0
+                )
+                retain_cutoff = datetime.datetime.fromtimestamp(
+                    most_recently_processed_frame_time - pre_capture
+                ).astimezone(datetime.timezone.utc)
+                if end_time < retain_cutoff:
                     Path(cache_path).unlink(missing_ok=True)
                     self.end_time_cache.pop(cache_path, None)
         # else retain days includes this segment
         else:
-            record_mode = self.config.cameras[camera].record.retain.mode
-            return await self.move_segment(
-                camera, start_time, end_time, duration, cache_path, record_mode
+            # assume that empty means the relevant recording info has not been received yet
+            camera_info = self.object_recordings_info[camera]
+            most_recently_processed_frame_time = (
+                camera_info[-1][0] if len(camera_info) > 0 else 0
             )
+
+            # ensure delayed segment info does not lead to lost segments
+            if (
+                datetime.datetime.fromtimestamp(
+                    most_recently_processed_frame_time
+                ).astimezone(datetime.timezone.utc)
+                >= end_time
+            ):
+                record_mode = self.config.cameras[camera].record.retain.mode
+                return await self.move_segment(
+                    camera, start_time, end_time, duration, cache_path, record_mode
+                )
 
     def segment_stats(
         self, camera: str, start_time: datetime.datetime, end_time: datetime.datetime
@@ -330,18 +351,18 @@ class RecordingMaintainer(threading.Thread):
             self.end_time_cache.pop(cache_path, None)
             return
 
+        # directory will be in utc due to start_time being in utc
         directory = os.path.join(
             RECORD_DIR,
-            start_time.astimezone(tz=datetime.timezone.utc).strftime("%Y-%m-%d/%H"),
+            start_time.strftime("%Y-%m-%d/%H"),
             camera,
         )
 
         if not os.path.exists(directory):
             os.makedirs(directory)
 
-        file_name = (
-            f"{start_time.replace(tzinfo=datetime.timezone.utc).strftime('%M.%S.mp4')}"
-        )
+        # file will be in utc due to start_time being in utc
+        file_name = f"{start_time.strftime('%M.%S.mp4')}"
         file_path = os.path.join(directory, file_name)
 
         try:
@@ -428,7 +449,9 @@ class RecordingMaintainer(threading.Thread):
                         current_tracked_objects,
                         motion_boxes,
                         regions,
-                    ) = self.object_recordings_info_queue.get(True, timeout=0.01)
+                    ) = self.object_recordings_info_queue.get(
+                        True, timeout=QUEUE_READ_TIMEOUT
+                    )
 
                     if frame_time < run_start - stale_frame_count_threshold:
                         stale_frame_count += 1
@@ -451,9 +474,7 @@ class RecordingMaintainer(threading.Thread):
                     break
 
             if stale_frame_count > 0:
-                logger.warning(
-                    f"Found {stale_frame_count} old frames, segments from recordings may be missing."
-                )
+                logger.debug(f"Found {stale_frame_count} old frames.")
 
             # empty the audio recordings info queue if audio is enabled
             if self.audio_recordings_info_queue:
@@ -466,7 +487,9 @@ class RecordingMaintainer(threading.Thread):
                             frame_time,
                             dBFS,
                             audio_detections,
-                        ) = self.audio_recordings_info_queue.get(True, timeout=0.01)
+                        ) = self.audio_recordings_info_queue.get(
+                            True, timeout=QUEUE_READ_TIMEOUT
+                        )
 
                         if frame_time < run_start - stale_frame_count_threshold:
                             stale_frame_count += 1

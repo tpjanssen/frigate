@@ -191,7 +191,8 @@ class FrigateApp:
                     "i",
                     self.config.cameras[camera_name].onvif.autotracking.enabled,
                 ),
-                "ptz_stopped": mp.Event(),
+                "ptz_tracking_active": mp.Event(),
+                "ptz_motor_stopped": mp.Event(),
                 "ptz_reset": mp.Event(),
                 "ptz_start_time": mp.Value("d", 0.0),  # type: ignore[typeddict-item]
                 # issue https://github.com/python/typeshed/issues/8799
@@ -212,7 +213,7 @@ class FrigateApp:
                 # issue https://github.com/python/typeshed/issues/8799
                 # from mypy 0.981 onwards
             }
-            self.ptz_metrics[camera_name]["ptz_stopped"].set()
+            self.ptz_metrics[camera_name]["ptz_motor_stopped"].set()
             self.feature_metrics[camera_name] = {
                 "audio_enabled": mp.Value(  # type: ignore[typeddict-item]
                     # issue https://github.com/python/typeshed/issues/8799
@@ -278,6 +279,17 @@ class FrigateApp:
             except PermissionError:
                 logger.error("Unable to write to /config to save DB state")
 
+        def cleanup_timeline_db(db: SqliteExtDatabase) -> None:
+            db.execute_sql(
+                "DELETE FROM timeline WHERE source_id NOT IN (SELECT id FROM event);"
+            )
+
+            try:
+                with open(f"{CONFIG_DIR}/.timeline", "w") as f:
+                    f.write(str(datetime.datetime.now().timestamp()))
+            except PermissionError:
+                logger.error("Unable to write to /config to save DB state")
+
         # Migrate DB location
         old_db_path = DEFAULT_DB_PATH
         if not os.path.isfile(self.config.database.path) and os.path.isfile(
@@ -292,6 +304,11 @@ class FrigateApp:
         del logging.getLogger("peewee_migrate").handlers[:]
         router = Router(migrate_db)
         router.run()
+
+        # this is a temporary check to clean up user DB from beta
+        # will be removed before final release
+        if not os.path.exists(f"{CONFIG_DIR}/.timeline"):
+            cleanup_timeline_db(migrate_db)
 
         # check if vacuum needs to be run
         if os.path.exists(f"{CONFIG_DIR}/.vacuum"):
@@ -444,6 +461,7 @@ class FrigateApp:
             self.config,
             self.onvif_controller,
             self.ptz_metrics,
+            self.dispatcher,
             self.stop_event,
         )
         self.ptz_autotracker_thread.start()
@@ -485,7 +503,9 @@ class FrigateApp:
         # create or update region grids for each camera
         for camera in self.config.cameras.values():
             self.region_grids[camera.name] = get_camera_regions_grid(
-                camera.name, camera.detect
+                camera.name,
+                camera.detect,
+                max(self.config.model.width, self.config.model.height),
             )
 
     def start_camera_processors(self) -> None:

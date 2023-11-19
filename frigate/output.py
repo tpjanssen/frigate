@@ -20,8 +20,8 @@ from ws4py.server.wsgirefserver import (
     WSGIServer,
 )
 from ws4py.server.wsgiutils import WebSocketWSGIApplication
-from ws4py.websocket import WebSocket
 
+from frigate.comms.ws import WebSocket
 from frigate.config import BirdseyeModeEnum, FrigateConfig
 from frigate.const import BASE_DIR, BIRDSEYE_PIPE
 from frigate.types import CameraMetricsTypes
@@ -36,11 +36,12 @@ logger = logging.getLogger(__name__)
 
 def get_standard_aspect_ratio(width: int, height: int) -> tuple[int, int]:
     """Ensure that only standard aspect ratios are used."""
+    # it is imoprtant that all ratios have the same scale
     known_aspects = [
         (16, 9),
         (9, 16),
-        (2, 1),
-        (8, 3),  # reolink duo 2
+        (20, 10),
+        (16, 6),  # reolink duo 2
         (32, 9),  # panoramic cameras
         (12, 9),
         (9, 12),
@@ -62,8 +63,8 @@ def get_canvas_shape(width: int, height: int) -> tuple[int, int]:
     a_w, a_h = get_standard_aspect_ratio(width, height)
 
     if round(a_w / a_h, 2) != round(width / height, 2):
-        canvas_width = width
-        canvas_height = int((canvas_width / a_w) * a_h)
+        canvas_width = int(width // 4 * 4)
+        canvas_height = int((canvas_width / a_w * a_h) // 4 * 4)
         logger.warning(
             f"The birdseye resolution is a non-standard aspect ratio, forcing birdseye resolution to {canvas_width} x {canvas_height}"
         )
@@ -107,9 +108,12 @@ class Canvas:
         return camera_aspect
 
 
-class FFMpegConverter:
+class FFMpegConverter(threading.Thread):
     def __init__(
         self,
+        camera: str,
+        input_queue: queue.Queue,
+        stop_event: mp.Event,
         in_width: int,
         in_height: int,
         out_width: int,
@@ -117,6 +121,11 @@ class FFMpegConverter:
         quality: int,
         birdseye_rtsp: bool = False,
     ):
+        threading.Thread.__init__(self)
+        self.name = f"{camera}_output_converter"
+        self.camera = camera
+        self.input_queue = input_queue
+        self.stop_event = stop_event
         self.bd_pipe = None
 
         if birdseye_rtsp:
@@ -166,7 +175,7 @@ class FFMpegConverter:
         os.close(stdin)
         self.reading_birdseye = False
 
-    def write(self, b) -> None:
+    def __write(self, b) -> None:
         self.process.stdin.write(b)
 
         if self.bd_pipe:
@@ -202,9 +211,25 @@ class FFMpegConverter:
             self.process.kill()
             self.process.communicate()
 
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                frame = self.input_queue.get(True, timeout=1)
+                self.__write(frame)
+            except queue.Empty:
+                pass
+
+        self.exit()
+
 
 class BroadcastThread(threading.Thread):
-    def __init__(self, camera, converter, websocket_server, stop_event):
+    def __init__(
+        self,
+        camera: str,
+        converter: FFMpegConverter,
+        websocket_server,
+        stop_event: mp.Event,
+    ):
         super(BroadcastThread, self).__init__()
         self.camera = camera
         self.converter = converter
@@ -462,7 +487,7 @@ class BirdsEyeFrameManager:
     def calculate_layout(self, cameras_to_add: list[str], coefficient) -> tuple[any]:
         """Calculate the optimal layout for 2+ cameras."""
 
-        def map_layout(row_height: int):
+        def map_layout(camera_layout: list[list[any]], row_height: int):
             """Map the calculated layout."""
             candidate_layout = []
             starting_x = 0
@@ -491,13 +516,16 @@ class BirdsEyeFrameManager:
                         x + scaled_width > self.canvas.width
                         or y + scaled_height > self.canvas.height
                     ):
-                        return 0, 0, None
+                        return x + scaled_width, y + scaled_height, None
 
                     final_row.append((cameras[0], (x, y, scaled_width, scaled_height)))
                     x += scaled_width
 
                 y += row_height
                 candidate_layout.append(final_row)
+
+            if max_width == 0:
+                max_width = x
 
             return max_width, y, candidate_layout
 
@@ -560,18 +588,35 @@ class BirdsEyeFrameManager:
             return None
 
         row_height = int(self.canvas.height / coefficient)
-        total_width, total_height, standard_candidate_layout = map_layout(row_height)
+        total_width, total_height, standard_candidate_layout = map_layout(
+            camera_layout, row_height
+        )
+
+        if not standard_candidate_layout:
+            # if standard layout didn't work
+            # try reducing row_height by the % overflow
+            scale_down_percent = max(
+                total_width / self.canvas.width,
+                total_height / self.canvas.height,
+            )
+            row_height = int(row_height / scale_down_percent)
+            total_width, total_height, standard_candidate_layout = map_layout(
+                camera_layout, row_height
+            )
+
+            if not standard_candidate_layout:
+                return None
 
         # layout can't be optimized more
         if total_width / self.canvas.width >= 0.99:
             return standard_candidate_layout
 
         scale_up_percent = min(
-            1 - (total_width / self.canvas.width),
-            1 - (total_height / self.canvas.height),
+            1 / (total_width / self.canvas.width),
+            1 / (total_height / self.canvas.height),
         )
-        row_height = int(row_height * (1 + round(scale_up_percent, 1)))
-        _, _, scaled_layout = map_layout(row_height)
+        row_height = int(row_height * scale_up_percent)
+        _, _, scaled_layout = map_layout(camera_layout, row_height)
 
         if scaled_layout:
             return scaled_layout
@@ -657,15 +702,20 @@ def output_frames(
     websocket_server.initialize_websockets_manager()
     websocket_thread = threading.Thread(target=websocket_server.serve_forever)
 
+    inputs: dict[str, queue.Queue] = {}
     converters = {}
     broadcasters = {}
 
     for camera, cam_config in config.cameras.items():
+        inputs[camera] = queue.Queue(maxsize=cam_config.detect.fps)
         width = int(
             cam_config.live.height
             * (cam_config.frame_shape[1] / cam_config.frame_shape[0])
         )
         converters[camera] = FFMpegConverter(
+            camera,
+            inputs[camera],
+            stop_event,
             cam_config.frame_shape[1],
             cam_config.frame_shape[0],
             width,
@@ -677,7 +727,11 @@ def output_frames(
         )
 
     if config.birdseye.enabled:
+        inputs["birdseye"] = queue.Queue(maxsize=10)
         converters["birdseye"] = FFMpegConverter(
+            "birdseye",
+            inputs["birdseye"],
+            stop_event,
             config.birdseye.width,
             config.birdseye.height,
             config.birdseye.width,
@@ -693,6 +747,9 @@ def output_frames(
         )
 
     websocket_thread.start()
+
+    for t in converters.values():
+        t.start()
 
     for t in broadcasters.values():
         t.start()
@@ -728,7 +785,11 @@ def output_frames(
             ws.environ["PATH_INFO"].endswith(camera) for ws in websocket_server.manager
         ):
             # write to the converter for the camera if clients are listening to the specific camera
-            converters[camera].write(frame.tobytes())
+            try:
+                inputs[camera].put_nowait(frame.tobytes())
+            except queue.Full:
+                # drop frames if queue is full
+                pass
 
         if config.birdseye.enabled and (
             config.birdseye.restream
@@ -749,7 +810,11 @@ def output_frames(
                 if config.birdseye.restream:
                     birdseye_buffer[:] = frame_bytes
 
-                converters["birdseye"].write(frame_bytes)
+                try:
+                    inputs["birdseye"].put_nowait(frame_bytes)
+                except queue.Full:
+                    # drop frames if queue is full
+                    pass
 
         if camera in previous_frames:
             frame_manager.delete(f"{camera}{previous_frames[camera]}")
@@ -769,10 +834,9 @@ def output_frames(
         frame = frame_manager.get(frame_id, config.cameras[camera].frame_shape_yuv)
         frame_manager.delete(frame_id)
 
-    for c in converters.values():
-        c.exit()
     for b in broadcasters.values():
         b.join()
+
     websocket_server.manager.close_all()
     websocket_server.manager.stop()
     websocket_server.manager.join()
